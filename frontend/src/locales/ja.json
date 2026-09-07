@@ -937,6 +937,9 @@
         "title": "SimpleFINで接続",
         "description": "SimpleFINは読み取り専用の銀行データプロトコルです。SimpleFIN Bridgeで銀行を選び、セットアップトークンをここにコピーしてください。"
       },
+      "truelayer": {
+        "description": "UK and European banks via TrueLayer open banking"
+      },
       "reconnectTitle": "新しいトークンで再接続",
       "reconnectDescription": "新しいセットアップトークンを貼り付けて、この接続をその場で更新します。既存の口座、取引、カテゴリ、ルールは保持されます。",
       "reconnect": "再接続"

@@ -145,7 +145,7 @@ class TrueLayerProvider(BankProvider):
         return httpx.AsyncClient(
             base_url=get_settings().truelayer_api_url.rstrip("/"),
             headers={
-                "Authorization": f"******",
+                "Authorization": " ".join(("Bearer", access_token)),
                 "Accept": "application/json",
                 "User-Agent": "Securo/0.1 (+https://usesecuro.com)",
             },
