@@ -953,7 +953,7 @@
         "description": "US-amerikanische und internationale Banken via SimpleFIN Bridge"
       },
       "truelayer": {
-        "description": "UK and European banks via TrueLayer open banking"
+        "description": "Britische und europäische Banken via TrueLayer Open Banking"
       }
     },
     "reconnected": "Bank erfolgreich erneut verbunden"

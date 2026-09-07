@@ -687,7 +687,7 @@
         "description": "Τράπεζες ΗΠΑ και διεθνείς μέσω SimpleFIN Bridge"
       },
       "truelayer": {
-        "description": "UK and European banks via TrueLayer open banking"
+        "description": "Τράπεζες Ηνωμένου Βασιλείου και Ευρώπης μέσω TrueLayer open banking"
       }
     },
     "reconnected": "Η τράπεζα επανασυνδέθηκε επιτυχώς"
