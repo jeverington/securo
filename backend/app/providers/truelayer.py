@@ -8,6 +8,7 @@ BankProvider dataclasses.
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
@@ -28,9 +29,20 @@ from app.providers.base import (
     mask_last4,
 )
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_HISTORY_DAYS = 90
 TOKEN_REFRESH_BUFFER_SECONDS = 300
 TRUELAYER_SCOPES = "info accounts balance transactions cards offline_access"
+
+# TrueLayer answers `endpoint_not_supported` when the connected bank does not
+# expose a resource at all: a card-only issuer (Barclaycard, Amex) has no
+# /accounts, and a bank with no cards has no /cards.
+ENDPOINT_NOT_SUPPORTED = (404, 501)
+# Amex refuses the balance of a supplementary card with access_denied for the
+# life of the connection, so a 403 on a *balance* means "not readable", not
+# "session dead" — 401 stays fatal and triggers reauth.
+BALANCE_UNAVAILABLE = (403, *ENDPOINT_NOT_SUPPORTED)
 
 
 def _parse_datetime(value: Any) -> Optional[datetime]:
@@ -54,6 +66,16 @@ def _parse_date(value: Any) -> Optional[date]:
     return None
 
 
+def _day_of_month(value: Any) -> Optional[int]:
+    """Day-of-month from a TrueLayer date, for the CC cycle fields.
+
+    Securo stores the statement/due anchors as a day number and re-derives the
+    cycle each month (see credit_card_service.get_cycle_dates).
+    """
+    parsed = _parse_date(value)
+    return parsed.day if parsed else None
+
+
 def _to_decimal(value: Any) -> Optional[Decimal]:
     if value is None or value == "":
         return None
@@ -61,6 +83,36 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _resource_id(raw: dict) -> str:
+    """Account/card identifier.
+
+    The Cards API keys each card by `account_id`, exactly like the Accounts
+    API — there is no `card_id` field — so both share this lookup.
+    """
+    for key in ("account_id", "card_id", "id"):
+        value = raw.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _balance_amount(balance: dict, *, fallback_to_available: bool = True) -> Decimal:
+    """Pick the balance TrueLayer reports for an account or card.
+
+    Presence, not truthiness: a genuine zero `current` must not fall through to
+    `available`. Cards pass fallback_to_available=False because a card's
+    `available` is available *credit* — the inverse of what it owes — so
+    reading it as a balance would report a paid-off card as deeply in debt.
+    """
+    keys = ("current", "available") if fallback_to_available else ("current",)
+    for key in keys:
+        if balance.get(key) is not None:
+            amount = _to_decimal(balance[key])
+            if amount is not None:
+                return amount
+    return Decimal("0")
 
 
 def _account_type(raw_type: Any) -> str:
@@ -93,6 +145,18 @@ def _transaction_id(account_external_id: str, raw: dict) -> str:
         _description(raw),
     ]
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def _error_detail(response: httpx.Response) -> str:
+    """Short, single-line excerpt of a provider error body for log messages."""
+    try:
+        body = response.text
+    except Exception:  # pragma: no cover - body already released
+        return ""
+    body = " ".join(body.split())
+    if not body:
+        return ""
+    return f" - {body[:300]}"
 
 
 def _token_value(credentials: dict, key: str) -> str:
@@ -162,10 +226,14 @@ class TrueLayerProvider(BankProvider):
         async with self._auth_client() as client:
             response = await client.post("/connect/token", data=body)
         if response.status_code in (400, 401):
-            raise SessionExpiredError("TrueLayer authorization expired or was rejected")
+            raise SessionExpiredError(
+                "TrueLayer authorization expired or was rejected"
+                f"{_error_detail(response)}"
+            )
         if response.status_code >= 400:
             raise httpx.HTTPStatusError(
-                f"TrueLayer token exchange failed: {response.status_code}",
+                "TrueLayer token exchange failed: "
+                f"{response.status_code}{_error_detail(response)}",
                 request=response.request,
                 response=response,
             )
@@ -178,19 +246,38 @@ class TrueLayerProvider(BankProvider):
         path: str,
         *,
         params: Optional[dict[str, Any]] = None,
-    ) -> dict:
+        tolerate: tuple[int, ...] = (),
+    ) -> Optional[dict]:
+        """GET/POST the Data API.
+
+        `tolerate` lists statuses that mean "this resource does not exist for
+        this bank" rather than "the call failed"; they return None so the
+        caller can tell an absent resource from an empty one. Never tolerate
+        401, and never tolerate 5xx or transport errors — a transient failure
+        must propagate so the sync aborts instead of persisting a wrong value.
+        """
         access_token = _token_value(credentials, "access_token")
         if not access_token:
             raise SessionExpiredError("TrueLayer access token missing")
         async with self._api_client(access_token) as client:
             response = await client.request(method, path, params=params)
+        if response.status_code in tolerate:
+            logger.warning(
+                "TrueLayer %s %s unavailable for this connection: %s%s",
+                method,
+                path,
+                response.status_code,
+                _error_detail(response),
+            )
+            return None
         if response.status_code in (401, 403):
             raise SessionExpiredError("TrueLayer session expired")
         if response.status_code == 429:
             raise ProviderRateLimited(f"TrueLayer {method} {path} returned 429")
         if response.status_code >= 400:
             raise httpx.HTTPStatusError(
-                f"TrueLayer {method} {path} failed: {response.status_code}",
+                f"TrueLayer {method} {path} failed: "
+                f"{response.status_code}{_error_detail(response)}",
                 request=response.request,
                 response=response,
             )
@@ -254,19 +341,32 @@ class TrueLayerProvider(BankProvider):
         )
 
     async def get_accounts(self, credentials: dict) -> list[AccountData]:
-        data = await self._request(credentials, "GET", "/accounts")
+        # Either list endpoint may be absent — card-only issuers have no
+        # /accounts, banks without cards have no /cards — but a connection
+        # exposing neither is a misconfiguration (wrong TRUELAYER_API_URL,
+        # missing scopes) that must not look like a bank with no accounts.
+        data = await self._request(
+            credentials, "GET", "/accounts", tolerate=ENDPOINT_NOT_SUPPORTED
+        )
+        cards = await self._request(
+            credentials, "GET", "/cards", tolerate=ENDPOINT_NOT_SUPPORTED
+        )
+        if data is None and cards is None:
+            raise RuntimeError(
+                "TrueLayer exposes neither /accounts nor /cards for this "
+                "connection - check TRUELAYER_API_URL and the granted scopes"
+            )
         result: list[AccountData] = []
-        for raw in data.get("results") or []:
-            if isinstance(raw, dict):
+        for raw in (data or {}).get("results") or []:
+            if isinstance(raw, dict) and _resource_id(raw):
                 result.append(await self._build_account(credentials, raw))
-        cards = await self._request(credentials, "GET", "/cards")
-        for raw in cards.get("results") or []:
-            if isinstance(raw, dict):
+        for raw in (cards or {}).get("results") or []:
+            if isinstance(raw, dict) and _resource_id(raw):
                 result.append(await self._build_card(credentials, raw))
         return result
 
     async def _build_account(self, credentials: dict, raw: dict) -> AccountData:
-        account_id = str(raw.get("account_id") or raw.get("id") or "")
+        account_id = _resource_id(raw)
         balance_raw = await self._balance(credentials, f"/accounts/{account_id}/balance")
         currency = raw.get("currency") or balance_raw.get("currency") or "GBP"
         provider = raw.get("provider") or {}
@@ -275,7 +375,7 @@ class TrueLayerProvider(BankProvider):
             external_id=account_id,
             name=raw.get("display_name") or raw.get("account_type") or "Account",
             type=_account_type(raw.get("account_type")),
-            balance=_to_decimal(balance_raw.get("current") or balance_raw.get("available")) or Decimal("0"),
+            balance=_balance_amount(balance_raw),
             currency=currency,
             masked_number=mask_last4(
                 account_number.get("iban")
@@ -288,24 +388,40 @@ class TrueLayerProvider(BankProvider):
         )
 
     async def _build_card(self, credentials: dict, raw: dict) -> AccountData:
-        card_id = str(raw.get("card_id") or raw.get("id") or "")
+        card_id = _resource_id(raw)
         balance_raw = await self._balance(credentials, f"/cards/{card_id}/balance")
         provider = raw.get("provider") or {}
         return AccountData(
             external_id=f"card:{card_id}",
             name=raw.get("display_name") or "Credit card",
             type="credit_card",
-            balance=(_to_decimal(balance_raw.get("current") or balance_raw.get("available")) or Decimal("0")).copy_abs(),
+            balance=_balance_amount(balance_raw, fallback_to_available=False),
             currency=raw.get("currency") or balance_raw.get("currency") or "GBP",
             masked_number=mask_last4(raw.get("partial_card_number")),
             credit_limit=_to_decimal(balance_raw.get("credit_limit")),
+            # `payment_due` is documented as the minimum due by the due date,
+            # so it maps to minimum_payment rather than the statement total.
+            statement_close_day=_day_of_month(balance_raw.get("last_statement_date")),
+            payment_due_day=_day_of_month(balance_raw.get("payment_due_date")),
+            minimum_payment=_to_decimal(balance_raw.get("payment_due")),
+            # TrueLayer reports the network (VISA/MASTERCARD/AMEX). It has no
+            # equivalent of Pluggy's card tier, so card_level stays unset.
+            card_brand=raw.get("card_network") or None,
             institution_external_id=provider.get("provider_id"),
             institution_name=provider.get("display_name"),
             institution_logo_url=provider.get("logo_uri"),
         )
 
     async def _balance(self, credentials: dict, path: str) -> dict:
-        data = await self._request(credentials, "GET", path)
+        # A balance the bank will never serve (Amex supplementary cards, or a
+        # provider without the endpoint) degrades to zero. A timeout or 5xx
+        # does NOT: sync writes account.balance unconditionally, so swallowing
+        # a transient failure would overwrite a real balance with zero.
+        data = await self._request(
+            credentials, "GET", path, tolerate=BALANCE_UNAVAILABLE
+        )
+        if data is None:
+            return {}
         balances = data.get("results") or []
         return balances[0] if balances and isinstance(balances[0], dict) else {}
 
@@ -321,7 +437,7 @@ class TrueLayerProvider(BankProvider):
         path = f"/cards/{resource_id}/transactions" if is_card else f"/accounts/{resource_id}/transactions"
         date_from = since or (date.today() - timedelta(days=DEFAULT_HISTORY_DAYS))
         params = {"from": date_from.isoformat(), "to": date.today().isoformat()}
-        data = await self._request(credentials, "GET", path, params=params)
+        data = await self._request(credentials, "GET", path, params=params) or {}
         return [
             txn
             for raw in data.get("results") or []
