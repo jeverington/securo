@@ -24,6 +24,7 @@ interface OAuthConnectDialogProps {
   onClose: () => void
   provider: string
   supportsAssetSync?: boolean
+  requiresInstitutionSelect?: boolean
 }
 
 const LAST_COUNTRY_KEY = 'securo:lastOAuthCountry'
@@ -41,7 +42,13 @@ function countryLabel(code: string): string {
   return REGION_NAMES.of(code) || code
 }
 
-export function OAuthConnectDialog({ open, onClose, provider, supportsAssetSync = false }: OAuthConnectDialogProps) {
+export function OAuthConnectDialog({
+  open,
+  onClose,
+  provider,
+  supportsAssetSync = false,
+  requiresInstitutionSelect = true,
+}: OAuthConnectDialogProps) {
   const { t } = useTranslation()
   const [step, setStep] = useState<'country' | 'bank'>('country')
   const [country, setCountry] = useState<string | null>(null)
@@ -61,6 +68,10 @@ export function OAuthConnectDialog({ open, onClose, provider, supportsAssetSync 
     setError(null)
     setRedirecting(false)
     setSyncAssets(true)
+    if (!requiresInstitutionSelect) {
+      setLoading(false)
+      return
+    }
     setLoading(true)
     connections
       .listInstitutions(provider)
@@ -74,7 +85,7 @@ export function OAuthConnectDialog({ open, onClose, provider, supportsAssetSync 
       })
       .catch(() => setError(t('accounts.loadingInstitutionsError')))
       .finally(() => setLoading(false))
-  }, [open, provider, t])
+  }, [open, provider, requiresInstitutionSelect, t])
 
   // Load banks when a country is picked.
   useEffect(() => {
@@ -100,6 +111,20 @@ export function OAuthConnectDialog({ open, onClose, provider, supportsAssetSync 
     setCountry(code)
     localStorage.setItem(LAST_COUNTRY_KEY, code)
     setStep('bank')
+  }
+
+  const handleDirectConnect = async () => {
+    setRedirecting(true)
+    try {
+      const url = await connections.getOAuthUrl(provider, {
+        ...(supportsAssetSync ? { sync_assets: syncAssets } : {}),
+      })
+      window.location.assign(url)
+    } catch (e) {
+      setRedirecting(false)
+      const message = e instanceof Error ? e.message : String(e)
+      toast.error(message || t('accounts.connectError'))
+    }
   }
 
   const handleBankSelect = async (institution: Institution) => {
@@ -134,10 +159,14 @@ export function OAuthConnectDialog({ open, onClose, provider, supportsAssetSync 
                 <ChevronLeft size={18} />
               </button>
             )}
-            {step === 'country' ? t('accounts.selectCountry') : t('accounts.selectBank')}
+            {!requiresInstitutionSelect
+              ? t('accounts.connectBank')
+              : step === 'country' ? t('accounts.selectCountry') : t('accounts.selectBank')}
           </DialogTitle>
           <p className="text-sm text-muted-foreground">
-            {step === 'country'
+            {!requiresInstitutionSelect
+              ? t('accounts.selectConnectorDesc')
+              : step === 'country'
               ? t('accounts.selectCountryDesc')
               : t('accounts.selectBankDesc')}
           </p>
@@ -172,6 +201,12 @@ export function OAuthConnectDialog({ open, onClose, provider, supportsAssetSync 
           </div>
         ) : error ? (
           <div className="py-8 text-center text-sm text-destructive">{error}</div>
+        ) : !requiresInstitutionSelect ? (
+          <div className="pt-2">
+            <Button className="w-full" onClick={handleDirectConnect}>
+              {t('accounts.connectBank')}
+            </Button>
+          </div>
         ) : step === 'country' ? (
           <div className="space-y-1 pt-2 max-h-[60vh] overflow-y-auto">
             {sortedCountries.length === 0 ? (

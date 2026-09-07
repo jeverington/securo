@@ -950,6 +950,9 @@
       },
       "simplefin": {
         "description": "SimpleFIN Bridge के ज़रिए अमेरिकी और अंतरराष्ट्रीय बैंक"
+      },
+      "truelayer": {
+        "description": "UK and European banks via TrueLayer open banking"
       }
     },
     "reconnected": "बैंक सफलतापूर्वक फिर से कनेक्ट हुआ"
