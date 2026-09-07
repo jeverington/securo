@@ -997,9 +997,6 @@
         "title": "Prepojiť cez SimpleFIN",
         "description": "SimpleFIN je protokol na bankové údaje len na čítanie. Prejdi na SimpleFIN Bridge, vyber svoju banku a skopíruj setup token sem."
       },
-      "truelayer": {
-        "description": "UK and European banks via TrueLayer open banking"
-      },
       "reconnectTitle": "Znovu prepojiť s novým tokenom",
       "reconnectDescription": "Vlož nový setup token a obnov toto prepojenie na mieste. Existujúce účty, transakcie, kategórie a pravidlá zostanú zachované.",
       "reconnect": "Znovu prepojiť"
@@ -1013,6 +1010,9 @@
       },
       "simplefin": {
         "description": "Americké a medzinárodné banky cez SimpleFIN Bridge"
+      },
+      "truelayer": {
+        "description": "UK and European banks via TrueLayer open banking"
       }
     },
     "reconnected": "Banka úspešne znovu prepojená"

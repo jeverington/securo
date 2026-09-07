@@ -946,9 +946,6 @@
         "title": "Подключение через SimpleFIN",
         "description": "SimpleFIN — это протокол банковских данных только для чтения. Перейдите в SimpleFIN Bridge, выберите свой банк и скопируйте установочный токен сюда."
       },
-      "truelayer": {
-        "description": "UK and European banks via TrueLayer open banking"
-      },
       "reconnectTitle": "Переподключить с новым токеном",
       "reconnectDescription": "Вставьте новый setup-токен, чтобы обновить это подключение на месте. Существующие счета, транзакции, категории и правила сохранятся.",
       "reconnect": "Переподключить"
@@ -962,6 +959,9 @@
       },
       "simplefin": {
         "description": "Банки США и других стран через SimpleFIN Bridge"
+      },
+      "truelayer": {
+        "description": "UK and European banks via TrueLayer open banking"
       }
     },
     "reconnected": "Банк успешно переподключён"

@@ -938,9 +938,6 @@
         "title": "Maak verbinding via SimpleFIN",
         "description": "SimpleFIN is een alleen-lezen bankgegevensprotocol. Ga naar de SimpleFIN Bridge, kies uw bank en kopieer het installatietoken hierheen."
       },
-      "truelayer": {
-        "description": "UK and European banks via TrueLayer open banking"
-      },
       "reconnectTitle": "Maak opnieuw verbinding met een nieuw token",
       "reconnectDescription": "Plak een nieuw installatietoken om deze verbinding te vernieuwen. Bestaande rekeningen, transacties, categorieën en regels blijven behouden.",
       "reconnect": "Maak opnieuw verbinding"
@@ -954,6 +951,9 @@
       },
       "simplefin": {
         "description": "Amerikaanse en internationale banken via SimpleFIN Bridge"
+      },
+      "truelayer": {
+        "description": "UK and European banks via TrueLayer open banking"
       }
     },
     "reconnected": "Bank heeft opnieuw verbinding gemaakt",

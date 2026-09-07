@@ -938,9 +938,6 @@
         "title": "Conectar vía SimpleFIN",
         "description": "SimpleFIN es un protocolo de datos bancarios de solo lectura. Ve al SimpleFIN Bridge, elige tu banco y copia el token de configuración aquí."
       },
-      "truelayer": {
-        "description": "UK and European banks via TrueLayer open banking"
-      },
       "reconnectTitle": "Reconectar con un token nuevo",
       "reconnectDescription": "Pega un token de configuración nuevo para actualizar esta conexión sin reemplazarla. Se conservan cuentas, transacciones, categorías y reglas existentes.",
       "reconnect": "Reconectar"
@@ -954,6 +951,9 @@
       },
       "simplefin": {
         "description": "Bancos de EE. UU. e internacionales vía SimpleFIN Bridge"
+      },
+      "truelayer": {
+        "description": "UK and European banks via TrueLayer open banking"
       }
     },
     "reconnected": "Banco reconectado correctamente"

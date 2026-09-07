@@ -195,6 +195,7 @@ async def test_get_transactions_maps_signed_amounts_and_raw_data(truelayer_env):
     assert txns[0].type == "debit"
     assert txns[0].date == date(2026, 1, 2)
     assert txns[0].payee == "Cafe"
+    assert txns[0].raw_data is not None
     assert txns[0].raw_data["transaction_id"] == "txn-1"
     assert txns[1].amount == Decimal("2.00")
     assert txns[1].type == "credit"

@@ -672,9 +672,6 @@
         "title": "Σύνδεση μέσω SimpleFIN",
         "description": "Το SimpleFIN είναι ένα πρωτόκολλο τραπεζικών δεδομένων μόνο για ανάγνωση. Μεταβείτε στο SimpleFIN Bridge, επιλέξτε την τράπεζά σας και αντιγράψτε το διακριτικό ρύθμισης εδώ."
       },
-      "truelayer": {
-        "description": "UK and European banks via TrueLayer open banking"
-      },
       "reconnectTitle": "Επανασύνδεση με νέο διακριτικό",
       "reconnectDescription": "Επικολλήστε ένα νέο διακριτικό ρύθμισης για να ανανεώσετε αυτήν τη σύνδεση. Οι υπάρχοντες λογαριασμοί, συναλλαγές, κατηγορίες και κανόνες διατηρούνται.",
       "reconnect": "Επανασύνδεση"
@@ -688,6 +685,9 @@
       },
       "simplefin": {
         "description": "Τράπεζες ΗΠΑ και διεθνείς μέσω SimpleFIN Bridge"
+      },
+      "truelayer": {
+        "description": "UK and European banks via TrueLayer open banking"
       }
     },
     "reconnected": "Η τράπεζα επανασυνδέθηκε επιτυχώς"
