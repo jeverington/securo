@@ -9,11 +9,15 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 
-from app.agents.services.crypto import decrypt
+from app.agents.services.crypto import decrypt, encrypt
 from app.providers.base import SessionExpiredError
 from app.providers.truelayer import (
     TRUELAYER_SCOPES,
     TrueLayerProvider,
+    _balance_amount,
+    _credentials_from_token_payload,
+    _https_endpoint,
+    _to_decimal,
     _token_value,
 )
 
@@ -761,19 +765,282 @@ async def test_list_institutions_skips_entries_without_provider_id(truelayer_env
     assert len(result.institutions) == len(_PROVIDER_CATALOGUE)
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["NaN", "-NaN", "sNaN", "Infinity", "-Infinity", "inf", float("nan"), float("inf")],
+)
+def test_to_decimal_rejects_non_finite_values(value):
+    assert _to_decimal(value) is None
+
+
+@pytest.mark.parametrize("value", ["12.50", "-3", 0, "0"])
+def test_to_decimal_keeps_finite_values(value):
+    assert _to_decimal(value) == Decimal(str(value))
+
+
+def test_balance_amount_falls_through_non_finite_current():
+    # A NaN `current` is unreadable, so `available` still gets its turn.
+    assert _balance_amount({"current": float("nan"), "available": "10.00"}) == Decimal(
+        "10.00"
+    )
+
+
+def test_balance_amount_returns_zero_when_every_field_non_finite():
+    assert _balance_amount({"current": "NaN", "available": "Infinity"}) == Decimal("0")
+
+
+def test_build_transaction_skips_non_finite_amount(truelayer_env):
+    provider = TrueLayerProvider()
+
+    # Guards against a regression that raises: Decimal("NaN") < 0 raises
+    # InvalidOperation, so a leaked NaN would abort the sync, not just this row.
+    assert (
+        provider._build_transaction(
+            "acc-1",
+            {"amount": float("nan"), "timestamp": "2026-01-05T00:00:00Z"},
+            "merchant",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "http://auth.truelayer.test",
+        "HTTP://auth.truelayer.test",
+        "ftp://auth.truelayer.test",
+        "auth.truelayer.test",
+        "",
+        None,
+    ],
+)
+def test_https_endpoint_rejects_non_https(value):
+    with pytest.raises(ValueError):
+        _https_endpoint(value, "TRUELAYER_AUTH_URL")
+
+
+def test_https_endpoint_preserves_normalisation():
+    assert (
+        _https_endpoint("  https://api.truelayer.test/data/v1/  ", "TRUELAYER_API_URL")
+        == "https://api.truelayer.test/data/v1"
+    )
+
+
 @pytest.mark.asyncio
-async def test_get_oauth_url_uses_picked_institution_and_narrows_scope(truelayer_env):
+async def test_plaintext_auth_url_blocks_credential_exchange(truelayer_env, monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setenv("TRUELAYER_AUTH_URL", "http://auth.truelayer.test")
+    get_settings.cache_clear()
+    provider = TrueLayerProvider()
+
+    # The client secret is posted to this host — refuse to build the client.
+    with pytest.raises(ValueError, match="TRUELAYER_AUTH_URL"):
+        provider._auth_client()
+    with pytest.raises(ValueError, match="TRUELAYER_AUTH_URL"):
+        await provider.get_oauth_url("https://app.example.com/oauth/callback", "s")
+
+
+def test_plaintext_api_url_blocks_bearer_token(truelayer_env, monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setenv("TRUELAYER_API_URL", "http://api.truelayer.test/data/v1")
+    get_settings.cache_clear()
+    provider = TrueLayerProvider()
+
+    with pytest.raises(ValueError, match="TRUELAYER_API_URL"):
+        provider._api_client("access-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [[{"access_token": "a"}], "a-string", 42])
+async def test_exchange_token_rejects_non_object_payload(truelayer_env, body):
     provider = TrueLayerProvider()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/providers"
+        return httpx.Response(200, json=body)
+
+    with _patch_clients(provider, handler)[0]:
+        # Would otherwise reach _credentials_from_token_payload and die on .get().
+        with pytest.raises(httpx.HTTPStatusError, match="non-object payload"):
+            await provider._exchange_token({"grant_type": "refresh_token"})
+
+
+@pytest.mark.asyncio
+async def test_exchange_token_rejects_non_json_body(truelayer_env):
+    provider = TrueLayerProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>gateway</html>")
+
+    with _patch_clients(provider, handler)[0]:
+        with pytest.raises(httpx.HTTPStatusError, match="non-object payload"):
+            await provider._exchange_token({"grant_type": "refresh_token"})
+
+
+@pytest.mark.asyncio
+async def test_data_api_rejects_non_object_payload(truelayer_env):
+    provider = TrueLayerProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"account_id": "acc-1"}])
+
+    with _patch_clients(provider, handler)[1]:
+        with pytest.raises(httpx.HTTPStatusError, match="non-object payload"):
+            await provider._request(
+                {"access_token": "access-1"}, "GET", "/accounts"
+            )
+
+
+@pytest.mark.asyncio
+async def test_data_api_still_returns_mapping_payloads(truelayer_env):
+    provider = TrueLayerProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": [{"account_id": "acc-1"}]})
+
+    with _patch_clients(provider, handler)[1]:
+        payload = await provider._request(
+            {"access_token": "access-1"}, "GET", "/accounts"
+        )
+
+    assert payload == {"results": [{"account_id": "acc-1"}]}
+
+
+@pytest.mark.asyncio
+async def test_tolerated_status_still_returns_none_not_an_error(truelayer_env):
+    provider = TrueLayerProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "endpoint_not_supported"})
+
+    with _patch_clients(provider, handler)[1]:
+        # An absent resource is not a malformed one — it must stay None.
+        assert (
+            await provider._request(
+                {"access_token": "access-1"}, "GET", "/cards", tolerate=(404,)
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_provider_catalogue_still_accepts_a_json_array(truelayer_env):
+    """The array guard must not have been applied to the public catalogue."""
+    provider = TrueLayerProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=_PROVIDER_CATALOGUE)
+
+    with _patch_clients(provider, handler)[0]:
+        result = await provider.list_institutions()
+
+    assert len(result.institutions) == len(_PROVIDER_CATALOGUE)
+
+
+@pytest.mark.asyncio
+async def test_refresh_credentials_keeps_scope_when_response_omits_it(truelayer_env):
+    """A refresh grant need not echo `scope`, and None must not overwrite it.
+
+    dict.update() in refresh_credentials merges the new payload over the stored
+    credentials, so an unconditional `scope: None` would erase what the bank
+    reported it granted at authorization.
+    """
+    provider = TrueLayerProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/connect/token"
+        return httpx.Response(
+            200,
+            # No "scope" key — the common shape for a refresh_token grant.
+            json={"access_token": "access-2", "expires_in": 3600},
+        )
+
+    with _patch_clients(provider, handler)[0]:
+        refreshed = await provider.refresh_credentials(
+            {
+                "access_token_enc": encrypt("access-1"),
+                "refresh_token_enc": encrypt("refresh-1"),
+                "expires_at": "2020-01-01T00:00:00+00:00",
+                "scope": "accounts balance transactions offline_access",
+            }
+        )
+
+    assert refreshed["scope"] == "accounts balance transactions offline_access"
+
+
+@pytest.mark.asyncio
+async def test_refresh_credentials_takes_a_reported_scope(truelayer_env):
+    provider = TrueLayerProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "access-2",
+                "expires_in": 3600,
+                "scope": "info accounts offline_access",
+            },
+        )
+
+    with _patch_clients(provider, handler)[0]:
+        refreshed = await provider.refresh_credentials(
+            {
+                "access_token_enc": encrypt("access-1"),
+                "refresh_token_enc": encrypt("refresh-1"),
+                "expires_at": "2020-01-01T00:00:00+00:00",
+                "scope": "accounts balance transactions offline_access",
+            }
+        )
+
+    assert refreshed["scope"] == "info accounts offline_access"
+
+
+def test_credentials_from_token_payload_omits_an_unreported_scope():
+    credentials = _credentials_from_token_payload(
+        {"access_token": "a", "expires_in": 60}
+    )
+    # Absent, not None — so dict.update() cannot erase an earlier value.
+    assert "scope" not in credentials
+
+
+@pytest.mark.asyncio
+async def test_get_accounts_still_expires_on_401(truelayer_env):
+    # A revoked or dead token is a 401, and that must stay fatal.
+    provider = TrueLayerProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "invalid_token"})
+
+    with _patch_clients(provider, handler)[1]:
+        with pytest.raises(SessionExpiredError):
+            await provider.get_accounts({"access_token": "access-1"})
+
+
+
+
+@pytest.mark.asyncio
+async def test_get_oauth_url_always_requests_the_full_scope(truelayer_env):
+    """The picked bank filters the link; it never narrows the scope.
+
+    Tailoring the scope per provider was tried and removed: every endpoint
+    gated by a scope then answers 403 for a healthy connection, which reads
+    as a dead session and expires it. Requesting everything keeps the token
+    uniform, and a bank that cannot serve a scope simply returns 404/501 on
+    that resource, which get_accounts already tolerates.
+    """
+    provider = TrueLayerProvider()
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json=[])
 
     with _patch_clients(provider, handler)[0]:
         url = await provider.get_oauth_url(
             "https://app.example.com/oauth/callback",
             "state-123",
-            # What the built-in picker posts.
             flow_params={
                 "institution_name": "ob-monzo",
                 "country": "GB",
@@ -783,64 +1050,39 @@ async def test_get_oauth_url_uses_picked_institution_and_narrows_scope(truelayer
 
     query = parse_qs(url.split("?", 1)[1])
     assert query["providers"] == ["ob-monzo"]
-    # Monzo serves no cards, so `cards` must not be requested or the link
-    # would resolve to no provider at all.
-    assert query["scope"] == ["info accounts balance transactions offline_access"]
+    assert query["scope"] == [TRUELAYER_SCOPES]
+    # And no catalogue lookup: building the link makes no network call at all.
+    assert seen == []
+
+
+def test_requested_scopes_are_all_used_and_exclude_identity():
+    """Least privilege: every requested scope must back a real endpoint call.
+
+    `info` in particular returns the account holder's name, date of birth,
+    address, phone and email. Nothing in this provider reads /info, so asking
+    for it would surface identity data on the consent screen of every bank a
+    user connects, for no functional gain.
+    """
+    requested = set(TRUELAYER_SCOPES.split())
+
+    assert requested == {
+        "accounts",  # GET /accounts
+        "balance",  # GET /{accounts,cards}/{id}/balance
+        "transactions",  # GET /{accounts,cards}/{id}/transactions
+        "cards",  # GET /cards
+        "offline_access",  # refresh token
+    }
+    assert "info" not in requested
 
 
 @pytest.mark.asyncio
-async def test_get_oauth_url_keeps_cards_scope_for_card_issuer(truelayer_env):
+async def test_authorization_url_requests_no_identity_scope(truelayer_env):
     provider = TrueLayerProvider()
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=_PROVIDER_CATALOGUE)
-
-    with _patch_clients(provider, handler)[0]:
-        url = await provider.get_oauth_url(
-            "https://app.example.com/oauth/callback",
-            "state-123",
-            flow_params={"institution_name": "ob-amex"},
-        )
+    url = await provider.get_oauth_url(
+        "https://app.example.com/oauth/callback", "state-123"
+    )
 
     scope = parse_qs(url.split("?", 1)[1])["scope"][0].split()
-    assert "cards" in scope
-    assert "accounts" not in scope
+    assert "info" not in scope
     assert "offline_access" in scope
-
-
-@pytest.mark.asyncio
-async def test_get_oauth_url_falls_back_to_full_scope_when_catalogue_fails(
-    truelayer_env,
-):
-    provider = TrueLayerProvider()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, json={"error": "unavailable"})
-
-    with _patch_clients(provider, handler)[0]:
-        url = await provider.get_oauth_url(
-            "https://app.example.com/oauth/callback",
-            "state-123",
-            flow_params={"institution_name": "ob-monzo"},
-        )
-
-    query = parse_qs(url.split("?", 1)[1])
-    assert query["providers"] == ["ob-monzo"]
-    assert query["scope"] == [TRUELAYER_SCOPES]
-
-
-@pytest.mark.asyncio
-async def test_get_oauth_url_keeps_unknown_provider_scope_intact(truelayer_env):
-    provider = TrueLayerProvider()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=_PROVIDER_CATALOGUE)
-
-    with _patch_clients(provider, handler)[0]:
-        url = await provider.get_oauth_url(
-            "https://app.example.com/oauth/callback",
-            "state-123",
-            flow_params={"institution_name": "ob-unlisted"},
-        )
-
-    assert parse_qs(url.split("?", 1)[1])["scope"] == [TRUELAYER_SCOPES]

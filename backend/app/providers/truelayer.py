@@ -12,7 +12,7 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 
@@ -35,7 +35,15 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_HISTORY_DAYS = 90
 TOKEN_REFRESH_BUFFER_SECONDS = 300
-TRUELAYER_SCOPES = "info accounts balance transactions cards offline_access"
+# Every scope here is load-bearing, and nothing else is requested: `accounts`
+# and `cards` for the two list endpoints, `balance` and `transactions` for the
+# per-resource reads, `offline_access` for the refresh token without which the
+# connection dies at the first token expiry. Notably absent is `info`, which
+# returns the account holder's name, date of birth, address, phone and email:
+# nothing here reads it, and asking for identity data we never use would put it
+# on the consent screen of every bank a user connects. Anything added to this
+# list must have an endpoint call to justify it.
+TRUELAYER_SCOPES = "accounts balance transactions cards offline_access"
 
 # TrueLayer answers `endpoint_not_supported` when the connected bank does not
 # expose a resource at all: a card-only issuer (Barclaycard, Amex) has no
@@ -102,9 +110,16 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
     if value is None or value == "":
         return None
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+    # JSON has no NaN/Infinity, but Python's decoder accepts them anyway and
+    # Decimal parses both without complaining. Neither is a usable amount, and
+    # a Decimal NaN is actively dangerous: unlike a float NaN it *raises*
+    # InvalidOperation on comparison, so one would abort a whole sync inside
+    # _build_transaction rather than just spoiling its own row. Treat them as
+    # unreadable, exactly like a value that failed to convert.
+    return parsed if parsed.is_finite() else None
 
 
 def _resource_id(raw: dict) -> str:
@@ -190,6 +205,49 @@ def _token_value(credentials: dict, key: str) -> str:
     return (credentials or {}).get(key) or ""
 
 
+def _json_object(response: httpx.Response, context: str) -> dict:
+    """Decode a response body that must be a JSON object.
+
+    TrueLayer answers the token and Data API endpoints with a mapping. Anything
+    else — an array, a bare string, a truncated body substituted by a proxy —
+    would otherwise sail past the status checks and only fail later on an
+    attribute lookup, far from the cause. Treat it like any other bad response
+    so the sync aborts instead of persisting whatever a half-parsed payload
+    happens to yield.
+
+    Note this is deliberately not used for the public provider catalogue, which
+    is legitimately a JSON array.
+    """
+    try:
+        payload = response.json()
+    except ValueError:  # includes json.JSONDecodeError
+        payload = None
+    if not isinstance(payload, dict):
+        raise httpx.HTTPStatusError(
+            f"TrueLayer {context} returned a non-object payload",
+            request=response.request,
+            response=response,
+        )
+    return payload
+
+
+def _https_endpoint(value: Any, setting: str) -> str:
+    """Normalise a configured TrueLayer endpoint, rejecting anything but HTTPS.
+
+    The client secret is posted to the auth host and every Data API call
+    carries a bearer token, so a plaintext endpoint would put both on the
+    wire. Both settings ship as https:// and TrueLayer serves nothing over
+    http — including its sandbox — so a downgrade can only be a deployment
+    mistake, and it must fail loudly rather than leak credentials.
+    """
+    url = str(value or "").strip().rstrip("/")
+    if not url:
+        raise ValueError(f"{setting} is not configured")
+    if urlparse(url).scheme != "https":
+        raise ValueError(f"{setting} must be an https:// URL")
+    return url
+
+
 def _credentials_from_token_payload(data: dict) -> dict[str, Any]:
     access_token = data.get("access_token") or ""
     refresh_token = data.get("refresh_token") or ""
@@ -198,9 +256,17 @@ def _credentials_from_token_payload(data: dict) -> dict[str, Any]:
     credentials: dict[str, Any] = {
         "access_token_enc": encrypt(access_token) or access_token,
         "expires_at": expires_at.isoformat(),
-        "scope": data.get("scope"),
         "token_type": data.get("token_type") or "Bearer",
     }
+    # Record a scope only when the response reported one. OAuth2 makes it
+    # optional and a refresh grant routinely omits it, since the scope has not
+    # changed — so writing None unconditionally would erase the scope captured
+    # at authorization the first time refresh_credentials merges this over the
+    # stored credentials. Keep what the bank told us it granted; it is the only
+    # record of that, and it is what a "why is this account missing?" question
+    # gets answered from.
+    if (scope := data.get("scope")) is not None:
+        credentials["scope"] = scope
     if refresh_token:
         credentials["refresh_token_enc"] = encrypt(refresh_token) or refresh_token
     return credentials
@@ -223,13 +289,17 @@ class TrueLayerProvider(BankProvider):
 
     def _auth_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
-            base_url=get_settings().truelayer_auth_url.rstrip("/"),
+            base_url=_https_endpoint(
+                get_settings().truelayer_auth_url, "TRUELAYER_AUTH_URL"
+            ),
             timeout=30.0,
         )
 
     def _api_client(self, access_token: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
-            base_url=get_settings().truelayer_api_url.rstrip("/"),
+            base_url=_https_endpoint(
+                get_settings().truelayer_api_url, "TRUELAYER_API_URL"
+            ),
             headers={
                 "Authorization": " ".join(("Bearer", access_token)),
                 "Accept": "application/json",
@@ -259,7 +329,7 @@ class TrueLayerProvider(BankProvider):
                 request=response.request,
                 response=response,
             )
-        return response.json()
+        return _json_object(response, "token exchange")
 
     async def _request(
         self,
@@ -303,7 +373,7 @@ class TrueLayerProvider(BankProvider):
                 request=response.request,
                 response=response,
             )
-        return response.json()
+        return _json_object(response, f"{method} {path}")
 
     async def _fetch_providers(self, country: Optional[str] = None) -> list[dict]:
         """Read TrueLayer's public provider catalogue.
@@ -361,42 +431,6 @@ class TrueLayerProvider(BankProvider):
             countries=sorted(countries), institutions=institutions
         )
 
-    async def _scope_for_provider(self, provider_id: str, requested: str) -> str:
-        """Narrow `requested` to the scopes this bank actually supports.
-
-        TrueLayer resolves an authorization link by intersecting the `providers`
-        filter with the banks that can serve every requested scope, so asking a
-        cards-less bank for `cards` leaves nothing to authorize and the link
-        dead-ends. `offline_access` is never dropped: without a refresh token
-        the connection would expire at the first token lifetime and never come
-        back. If the catalogue is unreachable, fall back to the full scope
-        rather than block the connection.
-        """
-        try:
-            catalogue = await self._fetch_providers()
-        except (httpx.HTTPError, ValueError):
-            logger.warning(
-                "TrueLayer provider lookup failed for %s; requesting full scope",
-                provider_id,
-            )
-            return requested
-        supported = next(
-            (
-                {str(s) for s in (item.get("scopes") or [])}
-                for item in catalogue
-                if item.get("provider_id") == provider_id
-            ),
-            None,
-        )
-        if not supported:
-            return requested
-        narrowed = [
-            scope
-            for scope in requested.split()
-            if scope in supported or scope == "offline_access"
-        ]
-        return " ".join(narrowed) or requested
-
     async def get_oauth_url(
         self,
         redirect_uri: str,
@@ -408,10 +442,7 @@ class TrueLayerProvider(BankProvider):
         # The institution picker posts the chosen bank as `institution_name`;
         # `providers` stays accepted so a caller can pass a raw TrueLayer filter.
         institution = str(flow.get("providers") or flow.get("institution_name") or "")
-        explicit_scope = flow.get("scope")
-        scope = str(explicit_scope or TRUELAYER_SCOPES)
-        if institution and not explicit_scope:
-            scope = await self._scope_for_provider(institution, scope)
+        scope = str(flow.get("scope") or TRUELAYER_SCOPES)
         params: dict[str, str] = {
             "response_type": "code",
             "client_id": settings.truelayer_client_id,
@@ -421,7 +452,8 @@ class TrueLayerProvider(BankProvider):
         }
         if institution:
             params["providers"] = institution
-        return f"{settings.truelayer_auth_url.rstrip('/')}/?{urlencode(params)}"
+        auth_url = _https_endpoint(settings.truelayer_auth_url, "TRUELAYER_AUTH_URL")
+        return f"{auth_url}/?{urlencode(params)}"
 
     async def reauth_url(
         self,
