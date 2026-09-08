@@ -11,7 +11,11 @@ import pytest
 
 from app.agents.services.crypto import decrypt
 from app.providers.base import SessionExpiredError
-from app.providers.truelayer import TrueLayerProvider, _token_value
+from app.providers.truelayer import (
+    TRUELAYER_SCOPES,
+    TrueLayerProvider,
+    _token_value,
+)
 
 
 @pytest.fixture
@@ -668,3 +672,175 @@ async def test_current_account_still_falls_back_to_available(truelayer_env):
         [account] = await provider.get_accounts({"access_token": "access-1"})
 
     assert account.balance == Decimal("12.50")
+
+
+_PROVIDER_CATALOGUE = [
+    {
+        "provider_id": "ob-monzo",
+        "display_name": "Monzo",
+        "country": "uk",
+        "logo_url": "https://assets.truelayer.test/monzo.svg",
+        "scopes": ["info", "accounts", "balance", "transactions", "offline_access"],
+    },
+    {
+        "provider_id": "ob-amex",
+        "display_name": "American Express",
+        "country": "uk",
+        "logo_url": "https://assets.truelayer.test/amex.svg",
+        "scopes": ["info", "cards", "balance", "transactions", "offline_access"],
+    },
+    {
+        "provider_id": "ob-bnp",
+        "display_name": "BNP Paribas",
+        "country": "fr",
+        "logo_url": None,
+        "scopes": ["info", "accounts", "balance", "transactions", "offline_access"],
+    },
+]
+
+
+@pytest.mark.asyncio
+async def test_list_institutions_maps_catalogue_and_normalises_country(truelayer_env):
+    provider = TrueLayerProvider()
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.url.path == "/api/providers"
+        return httpx.Response(200, json=_PROVIDER_CATALOGUE)
+
+    with _patch_clients(provider, handler)[0]:
+        result = await provider.list_institutions()
+
+    # TrueLayer says "uk"; the picker speaks ISO 3166-1 alpha-2.
+    assert result.countries == ["FR", "GB"]
+    assert [(i.name, i.display_name, i.country) for i in result.institutions] == [
+        ("ob-bnp", "BNP Paribas", "FR"),
+        ("ob-amex", "American Express", "GB"),
+        ("ob-monzo", "Monzo", "GB"),
+    ]
+    assert result.institutions[1].logo == "https://assets.truelayer.test/amex.svg"
+    # Scoped to this deployment's client, and never filtered by `scopes` —
+    # that would drop the card-only issuers.
+    query = parse_qs(seen[0].url.query.decode())
+    assert query["clientId"] == ["tl-client"]
+    assert "scopes" not in query
+
+
+@pytest.mark.asyncio
+async def test_list_institutions_translates_country_filter(truelayer_env):
+    provider = TrueLayerProvider()
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200, json=[p for p in _PROVIDER_CATALOGUE if p["country"] == "uk"]
+        )
+
+    with _patch_clients(provider, handler)[0]:
+        result = await provider.list_institutions("GB")
+
+    assert parse_qs(seen[0].url.query.decode())["country"] == ["uk"]
+    assert {i.country for i in result.institutions} == {"GB"}
+
+
+@pytest.mark.asyncio
+async def test_list_institutions_skips_entries_without_provider_id(truelayer_env):
+    provider = TrueLayerProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[{"display_name": "Nameless", "country": "uk"}, *_PROVIDER_CATALOGUE],
+        )
+
+    with _patch_clients(provider, handler)[0]:
+        result = await provider.list_institutions()
+
+    assert len(result.institutions) == len(_PROVIDER_CATALOGUE)
+
+
+@pytest.mark.asyncio
+async def test_get_oauth_url_uses_picked_institution_and_narrows_scope(truelayer_env):
+    provider = TrueLayerProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/providers"
+        return httpx.Response(200, json=_PROVIDER_CATALOGUE)
+
+    with _patch_clients(provider, handler)[0]:
+        url = await provider.get_oauth_url(
+            "https://app.example.com/oauth/callback",
+            "state-123",
+            # What the built-in picker posts.
+            flow_params={
+                "institution_name": "ob-monzo",
+                "country": "GB",
+                "valid_until_days": None,
+            },
+        )
+
+    query = parse_qs(url.split("?", 1)[1])
+    assert query["providers"] == ["ob-monzo"]
+    # Monzo serves no cards, so `cards` must not be requested or the link
+    # would resolve to no provider at all.
+    assert query["scope"] == ["info accounts balance transactions offline_access"]
+
+
+@pytest.mark.asyncio
+async def test_get_oauth_url_keeps_cards_scope_for_card_issuer(truelayer_env):
+    provider = TrueLayerProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_PROVIDER_CATALOGUE)
+
+    with _patch_clients(provider, handler)[0]:
+        url = await provider.get_oauth_url(
+            "https://app.example.com/oauth/callback",
+            "state-123",
+            flow_params={"institution_name": "ob-amex"},
+        )
+
+    scope = parse_qs(url.split("?", 1)[1])["scope"][0].split()
+    assert "cards" in scope
+    assert "accounts" not in scope
+    assert "offline_access" in scope
+
+
+@pytest.mark.asyncio
+async def test_get_oauth_url_falls_back_to_full_scope_when_catalogue_fails(
+    truelayer_env,
+):
+    provider = TrueLayerProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    with _patch_clients(provider, handler)[0]:
+        url = await provider.get_oauth_url(
+            "https://app.example.com/oauth/callback",
+            "state-123",
+            flow_params={"institution_name": "ob-monzo"},
+        )
+
+    query = parse_qs(url.split("?", 1)[1])
+    assert query["providers"] == ["ob-monzo"]
+    assert query["scope"] == [TRUELAYER_SCOPES]
+
+
+@pytest.mark.asyncio
+async def test_get_oauth_url_keeps_unknown_provider_scope_intact(truelayer_env):
+    provider = TrueLayerProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_PROVIDER_CATALOGUE)
+
+    with _patch_clients(provider, handler)[0]:
+        url = await provider.get_oauth_url(
+            "https://app.example.com/oauth/callback",
+            "state-123",
+            flow_params={"institution_name": "ob-unlisted"},
+        )
+
+    assert parse_qs(url.split("?", 1)[1])["scope"] == [TRUELAYER_SCOPES]

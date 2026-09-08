@@ -46,7 +46,7 @@ KNOWN_PROVIDERS = [
         "display_name": "TrueLayer",
         "description": "UK and European banks via TrueLayer open banking",
         "flow_type": "oauth",
-        "requires_institution_select": False,
+        "requires_institution_select": True,
         "supports_asset_sync": False,
     },
 ]

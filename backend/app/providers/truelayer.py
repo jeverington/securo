@@ -22,6 +22,8 @@ from app.providers.base import (
     AccountData,
     BankProvider,
     ConnectionData,
+    InstitutionData,
+    InstitutionListData,
     ProviderRateLimited,
     SessionExpiredError,
     TransactionData,
@@ -43,6 +45,26 @@ ENDPOINT_NOT_SUPPORTED = (404, 501)
 # life of the connection, so a 403 on a *balance* means "not readable", not
 # "session dead" — 401 stays fatal and triggers reauth.
 BALANCE_UNAVAILABLE = (403, *ENDPOINT_NOT_SUPPORTED)
+
+# TrueLayer labels providers with lowercase codes that are mostly ISO 3166-1
+# alpha-2 but not always: it says "uk" where the standard says "GB". The
+# institution picker speaks ISO, so translate on the way in and out.
+_ISO_BY_TRUELAYER_COUNTRY = {"uk": "GB"}
+_TRUELAYER_COUNTRY_BY_ISO = {v: k for k, v in _ISO_BY_TRUELAYER_COUNTRY.items()}
+
+
+def _iso_country(value: Any) -> str:
+    code = str(value or "").strip().lower()
+    if not code:
+        return ""
+    return _ISO_BY_TRUELAYER_COUNTRY.get(code, code.upper())
+
+
+def _truelayer_country(value: Any) -> str:
+    code = str(value or "").strip().upper()
+    if not code:
+        return ""
+    return _TRUELAYER_COUNTRY_BY_ISO.get(code, code.lower())
 
 
 def _parse_datetime(value: Any) -> Optional[datetime]:
@@ -283,6 +305,98 @@ class TrueLayerProvider(BankProvider):
             )
         return response.json()
 
+    async def _fetch_providers(self, country: Optional[str] = None) -> list[dict]:
+        """Read TrueLayer's public provider catalogue.
+
+        Unauthenticated, but scoped to `clientId` so the list matches the banks
+        this deployment is actually enabled for. Deliberately not filtered by
+        `scopes`: that parameter keeps only providers supporting *every* scope
+        asked for, which would hide card-only issuers such as Amex and
+        Barclaycard — the very ones this provider goes out of its way to sync.
+        """
+        settings = get_settings()
+        params: dict[str, str] = {}
+        if settings.truelayer_client_id:
+            params["clientId"] = settings.truelayer_client_id
+        if country and (mapped := _truelayer_country(country)):
+            params["country"] = mapped
+        async with self._auth_client() as client:
+            response = await client.get("/api/providers", params=params or None)
+        if response.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                "TrueLayer provider listing failed: "
+                f"{response.status_code}{_error_detail(response)}",
+                request=response.request,
+                response=response,
+            )
+        payload = response.json()
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+    async def list_institutions(
+        self, country: Optional[str] = None
+    ) -> InstitutionListData:
+        institutions: list[InstitutionData] = []
+        countries: set[str] = set()
+        for item in await self._fetch_providers(country):
+            # provider_id is what the authorization link's `providers` filter
+            # expects, so it is the canonical name we must round-trip.
+            provider_id = str(item.get("provider_id") or "").strip()
+            if not provider_id:
+                continue
+            iso = _iso_country(item.get("country"))
+            if iso:
+                countries.add(iso)
+            institutions.append(
+                InstitutionData(
+                    name=provider_id,
+                    display_name=str(item.get("display_name") or provider_id),
+                    country=iso,
+                    logo=item.get("logo_url"),
+                )
+            )
+        institutions.sort(key=lambda i: (i.country, i.display_name.lower()))
+        return InstitutionListData(
+            countries=sorted(countries), institutions=institutions
+        )
+
+    async def _scope_for_provider(self, provider_id: str, requested: str) -> str:
+        """Narrow `requested` to the scopes this bank actually supports.
+
+        TrueLayer resolves an authorization link by intersecting the `providers`
+        filter with the banks that can serve every requested scope, so asking a
+        cards-less bank for `cards` leaves nothing to authorize and the link
+        dead-ends. `offline_access` is never dropped: without a refresh token
+        the connection would expire at the first token lifetime and never come
+        back. If the catalogue is unreachable, fall back to the full scope
+        rather than block the connection.
+        """
+        try:
+            catalogue = await self._fetch_providers()
+        except (httpx.HTTPError, ValueError):
+            logger.warning(
+                "TrueLayer provider lookup failed for %s; requesting full scope",
+                provider_id,
+            )
+            return requested
+        supported = next(
+            (
+                {str(s) for s in (item.get("scopes") or [])}
+                for item in catalogue
+                if item.get("provider_id") == provider_id
+            ),
+            None,
+        )
+        if not supported:
+            return requested
+        narrowed = [
+            scope
+            for scope in requested.split()
+            if scope in supported or scope == "offline_access"
+        ]
+        return " ".join(narrowed) or requested
+
     async def get_oauth_url(
         self,
         redirect_uri: str,
@@ -290,16 +404,23 @@ class TrueLayerProvider(BankProvider):
         flow_params: Optional[dict] = None,
     ) -> str:
         settings = get_settings()
+        flow = flow_params or {}
+        # The institution picker posts the chosen bank as `institution_name`;
+        # `providers` stays accepted so a caller can pass a raw TrueLayer filter.
+        institution = str(flow.get("providers") or flow.get("institution_name") or "")
+        explicit_scope = flow.get("scope")
+        scope = str(explicit_scope or TRUELAYER_SCOPES)
+        if institution and not explicit_scope:
+            scope = await self._scope_for_provider(institution, scope)
         params: dict[str, str] = {
             "response_type": "code",
             "client_id": settings.truelayer_client_id,
             "redirect_uri": redirect_uri,
-            "scope": str((flow_params or {}).get("scope") or TRUELAYER_SCOPES),
+            "scope": scope,
             "state": state,
         }
-        providers = (flow_params or {}).get("providers")
-        if providers:
-            params["providers"] = str(providers)
+        if institution:
+            params["providers"] = institution
         return f"{settings.truelayer_auth_url.rstrip('/')}/?{urlencode(params)}"
 
     async def reauth_url(
